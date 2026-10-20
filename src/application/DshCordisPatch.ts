@@ -1,13 +1,21 @@
 import { isMap, isSeq, type Node, type YAMLMap } from "yaml";
-import { parseEnvironment } from "../config/environment.js";
+import {
+  parseEnvironment,
+  parseEnvironmentValues,
+} from "../config/environment.js";
 import { ConfigurationError } from "../domain/configurationErrors.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { ClientConfigurationDocument } from "./ClientConfigurationDocument.js";
 import { CordisExpression, DshCordisYaml } from "./DshCordisYaml.js";
+import {
+  mergeEnvironmentOverrides,
+  snapshotEnvironment,
+} from "../process/snapshotEnvironment.js";
 
 export const DSH_ENTRY_ID = "rea-mcp";
 export const DSH_CLIENT_PACKAGE = "@deepseek-ai/dsh-mcp-client";
 const LAUNCHER_KEYS = new Set(["serverName", "transport", "command", "args"]);
+const SELECTOR_KEYS = new Set(["id", "name"]);
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" &&
   value !== null &&
@@ -19,6 +27,7 @@ interface PatchOperation {
   readonly map: YAMLMap<unknown, unknown>;
   readonly ownedRows: readonly number[];
   readonly direct: boolean;
+  readonly unknownApplicability: boolean;
 }
 
 /** One interpretation of identity, ordered patch applicability and source nodes. */
@@ -29,6 +38,8 @@ export class DshCordisDocument {
   #entryNode: YAMLMap<unknown, unknown> | undefined;
   readonly #insertions: number;
   #unknownSelector = false;
+  #unknownStructure = false;
+  readonly #editabilityError: ConfigurationError | undefined;
   readonly config: Record<string, unknown> | undefined;
 
   constructor(text: string) {
@@ -38,22 +49,39 @@ export class DshCordisDocument {
       throw new ConfigurationError("Cordis patches must be a list");
     const operations: PatchOperation[] = [];
     let insertions = 0;
+    let malformedStructure = false;
     for (const source of root.items) {
       const map = this.#map(source);
-      if (map === undefined) continue;
+      if (map === undefined) {
+        if (this.#yaml.value(source) instanceof CordisExpression)
+          this.#unknownStructure = true;
+        else malformedStructure = true;
+        continue;
+      }
       const inserted = this.#yaml.resolve(this.#yaml.field(map, "insert"));
       const targetId = this.#id(map);
+      const unknownApplicability = targetId !== undefined;
+      const insertedValue = this.#yaml.value(inserted);
+      const invalidEntries = isSeq(inserted)
+        ? inserted.items.filter((entry) => this.#map(entry) === undefined)
+        : [];
+      if (
+        insertedValue instanceof CordisExpression ||
+        invalidEntries.some(
+          (entry) => this.#yaml.value(entry) instanceof CordisExpression,
+        )
+      )
+        this.#unknownStructure = true;
+      else if (insertedValue != null && !isSeq(inserted))
+        malformedStructure = true;
+      else if (invalidEntries.length > 0) malformedStructure = true;
       const ownedRows = isSeq(inserted)
         ? inserted.items.flatMap((entry, index) =>
             this.#id(entry) === DSH_ENTRY_ID ? [index] : [],
           )
         : [];
       const direct = !isSeq(inserted) && targetId === DSH_ENTRY_ID;
-      if (ownedRows.length > 0 && targetId)
-        throw new ConfigurationError(
-          "Cannot establish the target group for a Cordis REA insertion from the home patch alone",
-        );
-      operations.push({ source, map, ownedRows, direct });
+      operations.push({ source, map, ownedRows, direct, unknownApplicability });
       if (isSeq(inserted)) {
         for (const index of ownedRows) {
           const entry = this.#map(inserted.items[index]);
@@ -81,6 +109,33 @@ export class DshCordisDocument {
     }
     this.#operations = operations;
     this.#insertions = insertions;
+    this.#editabilityError = this.#unknownStructure
+      ? new ConfigurationError(
+          "Expression-backed Cordis patches have unknown structure; use literal patches before setup",
+        )
+      : malformedStructure
+        ? new ConfigurationError(
+            "Malformed Cordis patches cannot be edited safely; use mapping entries and insert lists before setup",
+          )
+        : operations.some(
+              (op) => op.unknownApplicability && op.ownedRows.length > 0,
+            )
+          ? new ConfigurationError(
+              "Cordis REA insertion targets a group with unknown activity; use a direct insertion before setup",
+            )
+          : this.#unknownSelector
+            ? new ConfigurationError(
+                "Expression-backed Cordis name selectors have unknown applicability; use literal selectors before setup",
+                {
+                  settings: [
+                    {
+                      setting: "name",
+                      constraint: "Use literal selectors before setup",
+                    },
+                  ],
+                },
+              )
+            : undefined;
     const config = this.#field("config");
     // Ownership survives malformed config so uninstall can remove the source row.
     this.config = insertions === 0 ? undefined : isRecord(config) ? config : {};
@@ -114,11 +169,17 @@ export class DshCordisDocument {
   get carriesEntry(): boolean {
     return this.#operations.some((op) => op.direct || op.ownedRows.length > 0);
   }
+  get hasUnknownStructure(): boolean {
+    return this.#unknownStructure;
+  }
+  get editabilityError(): ConfigurationError | undefined {
+    return this.#editabilityError;
+  }
   get ready(): boolean {
     const disabled = this.#field("disabled");
     return (
       this.#insertions === 1 &&
-      !this.#unknownSelector &&
+      this.#editabilityError === undefined &&
       this.#field("name") === DSH_CLIENT_PACKAGE &&
       (disabled === undefined || disabled === false)
     );
@@ -127,21 +188,9 @@ export class DshCordisDocument {
   /** Validate literals without treating expression source as an environment value. */
   environment(
     overrides: Readonly<Record<string, string>> = {},
+    validation: "fragment" | "effective" = "effective",
+    platform: NodeJS.Platform = process.platform,
   ): Result<Readonly<Record<string, string>>, ConfigurationError> {
-    if (this.#unknownSelector)
-      return err(
-        new ConfigurationError(
-          "Expression-backed Cordis name selectors have unknown applicability; use literal selectors before setup",
-          {
-            settings: [
-              {
-                setting: "name",
-                constraint: "Use literal selectors before setup",
-              },
-            ],
-          },
-        ),
-      );
     const config = this.#field("config");
     if (config instanceof CordisExpression)
       return err(
@@ -175,8 +224,14 @@ export class DshCordisDocument {
         new ConfigurationError("Cordis server environment must be a mapping"),
       );
     const literals: Record<string, string> = {};
-    for (const [key, value] of Object.entries(raw ?? {})) {
-      if (value instanceof CordisExpression) continue;
+    const unresolvedSettings = new Set<string>();
+    for (const [key, value] of Object.entries(
+      mergeEnvironmentOverrides<unknown>(raw ?? {}, overrides, platform),
+    )) {
+      if (value instanceof CordisExpression) {
+        unresolvedSettings.add(key);
+        continue;
+      }
       if (typeof value !== "string")
         return err(
           new ConfigurationError("Invalid Cordis server environment", {
@@ -191,8 +246,20 @@ export class DshCordisDocument {
         );
       literals[key] = value;
     }
-    const environment = { ...literals, ...overrides };
-    const validated = parseEnvironment(environment);
+    const environment = literals;
+    const runtimeEnvironment = snapshotEnvironment(environment, platform);
+    const unresolved = new Set(
+      Object.keys(
+        snapshotEnvironment(
+          Object.fromEntries([...unresolvedSettings].map((key) => [key, ""])),
+          platform,
+        ),
+      ),
+    );
+    const validated =
+      validation === "fragment"
+        ? parseEnvironmentValues(runtimeEnvironment, unresolved)
+        : parseEnvironment(runtimeEnvironment, unresolved);
     return validated.ok ? ok(environment) : validated;
   }
 
@@ -200,12 +267,14 @@ export class DshCordisDocument {
     command: readonly string[],
     overrides: Readonly<Record<string, string>>,
   ): Result<Record<string, unknown>, ConfigurationError> {
+    if (this.#editabilityError !== undefined)
+      return err(this.#editabilityError);
     const environment = this.environment(overrides);
     if (!environment.ok) return environment;
-    const env = {
-      ...(isRecord(this.config?.env) ? this.config.env : {}),
-      ...overrides,
-    };
+    const env = mergeEnvironmentOverrides<unknown>(
+      isRecord(this.config?.env) ? this.config.env : {},
+      overrides,
+    );
     const desired = { ...this.config, ...dshClientRegistrationEntry(command) };
     delete desired.env;
     if (Object.keys(env).length > 0) desired.env = env;
@@ -214,6 +283,11 @@ export class DshCordisDocument {
 
   /** Plan every replacement from source snapshots before changing an output tree. */
   serialize(desired?: Record<string, unknown>): string {
+    if (
+      this.#editabilityError !== undefined &&
+      (this.#unknownStructure || desired !== undefined)
+    )
+      throw this.#editabilityError;
     const root = this.#yaml.document.contents;
     if (!isSeq(root))
       throw new ConfigurationError("Cordis patches must be a list");
@@ -249,10 +323,15 @@ export class DshCordisDocument {
         carried = true;
         return [this.#entry(desired, invalidated)] as typeof inserted.items;
       });
-      replacements.set(
-        op.source,
-        inserted.items.length === 0 ? undefined : copy,
-      );
+      if (inserted.items.length === 0) copy.delete("insert");
+      // An emptied operation keeps caller fields unless it would patch REA's row.
+      const kept =
+        inserted.items.length > 0 ||
+        (this.#id(op.map) !== DSH_ENTRY_ID &&
+          copy.items.some(
+            (pair) => !SELECTOR_KEYS.has(this.#yaml.value(pair.key) as string),
+          ));
+      replacements.set(op.source, kept ? copy : undefined);
     }
     const output = this.#yaml.document.clone();
     const outputRoot = output.contents;
@@ -310,6 +389,21 @@ export class DshCordisDocument {
           : this.#yaml.detach(env, invalidated);
       if (!isMap(nextEnv))
         throw new ConfigurationError("Cordis environment is not a mapping");
+      for (const pair of [...nextEnv.items]) {
+        const key = this.#yaml.key(pair.key);
+        if (Object.hasOwn(desiredEnv, key)) {
+          this.#yaml.renameKey(nextEnv, pair, key);
+          continue;
+        }
+        const alias =
+          process.platform === "win32"
+            ? Object.keys(desiredEnv).find(
+                (name) => name.toUpperCase() === key.toUpperCase(),
+              )
+            : undefined;
+        if (alias === undefined) nextEnv.delete(pair.key);
+        else this.#yaml.renameKey(nextEnv, pair, alias);
+      }
       for (const [key, value] of Object.entries(desiredEnv)) {
         this.#yaml.setValue(nextEnv, key, value);
       }

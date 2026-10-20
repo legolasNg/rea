@@ -24,10 +24,12 @@ import {
   type JsonObjectMemberReader,
 } from "./JsonInputFile.js";
 import { NonRegularFileReadError } from "../filesystem/RegularFile.js";
+import { RegularFileCleanupFailure } from "./RegularFileRead.js";
 import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { OwnedStagedOutput } from "../filesystem/OwnedStagedOutput.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 
 /** Request control and its owning operation for an interruptible atomic write. */
 export interface TextWriteCancellation {
@@ -42,12 +44,14 @@ type TextWriteResult<Failure = EvidenceFileError | AnalysisCancelledError> =
 export const readJsonFile = async (
   path: string,
   signal?: AbortSignal,
+  resources?: ArtifactResourceScope,
 ): Promise<
   Result<unknown, EvidenceFileError | AnalysisResourceConstraintError>
 > =>
   readJsonFileInput(
     path,
-    (selected) => readJsonInputFile(selected, "read_evidence_file", signal),
+    (selected) =>
+      readJsonInputFile(selected, "read_evidence_file", signal, resources),
     signal,
   );
 
@@ -56,6 +60,7 @@ export const readJsonObjectMembersFile = (
   path: string,
   scans: readonly ReadonlyMap<string, JsonObjectMemberReader>[],
   signal?: AbortSignal,
+  resources?: ArtifactResourceScope,
 ): Promise<
   Result<
     void,
@@ -65,7 +70,13 @@ export const readJsonObjectMembersFile = (
   readJsonFileInput(
     path,
     (selected) =>
-      readJsonObjectFile(selected, "read_evidence_file", scans, signal),
+      readJsonObjectFile(
+        selected,
+        "read_evidence_file",
+        scans,
+        signal,
+        resources,
+      ),
     signal,
   );
 
@@ -84,7 +95,7 @@ const readJsonFileInput = async <Value>(
 ): Promise<
   Result<Value, EvidenceFileError | AnalysisResourceConstraintError>
 > => {
-  const requestedPath = resolve(path);
+  const requestedPath = absoluteCallerPath(path);
   try {
     const decoded = await read(requestedPath);
     if (!decoded.ok) {
@@ -103,6 +114,7 @@ const readJsonFileInput = async <Value>(
     }
     return ok(decoded.value);
   } catch (cause: unknown) {
+    if (cause instanceof RegularFileCleanupFailure) throw cause;
     if (cause instanceof AnalysisResourceConstraintError) return err(cause);
     if (signal?.aborted === true) throw cause;
     return err(
@@ -162,7 +174,7 @@ export function writeTextParts(
       return err(
         new EvidenceFileError("write", "io", {
           cause,
-          path: resolve(path),
+          path: absoluteCallerPath(path),
           ...(cleanup === undefined ? {} : { cleanup }),
         }),
       );
@@ -176,9 +188,13 @@ const writeTextPartsOwned = async (
   resources: ArtifactResourceScope,
   cancellation?: TextWriteCancellation,
 ): Promise<TextWriteResult> => {
-  const requestedPath = resolve(path);
+  const requestedPath = absoluteCallerPath(path);
   try {
     assertWriteActive(cancellation);
+    if (process.platform !== "win32" && requestedPath.endsWith("/"))
+      return err(
+        new EvidenceFileError("write", "not-file", { path: requestedPath }),
+      );
     const canonicalParent = await realpath(dirname(requestedPath));
     const destination = resolve(canonicalParent, basename(requestedPath));
     const existing = await lstat(destination).catch((cause: unknown) => {
@@ -277,7 +293,7 @@ const publishFile = async (
   const staged = resolve(stagingDirectory, "content");
   try {
     const file = await open(staged, "wx", 0o600);
-    await owner.setFile(new OwnedFileHandle(file));
+    owner.setFile(new OwnedFileHandle(file));
     let written: Result<number, unknown>;
     try {
       const bytes = await writeStagedParts(file, parts, cancellation);

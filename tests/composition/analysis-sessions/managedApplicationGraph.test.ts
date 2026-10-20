@@ -301,6 +301,51 @@ describe("managed application graph identity facts", () => {
       ),
     ).toEqual([]);
   });
+
+  it("projects a module whose metadata name is empty without a label", () => {
+    const bytes = buildManagedPeFixture({ ilBody: Buffer.from([0x06, 0x2a]) });
+    const control = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes, "/fixture/EmptyModuleName.dll"),
+    );
+    if (control.module === null) throw new Error("Expected a Module row");
+    // Point the Module row's Name at the string heap's empty entry.
+    bytes.writeUInt16LE(0, control.module.row_offset + 2);
+    const binary = managedPeFixtureTarget(
+      bytes,
+      "/fixture/EmptyModuleName.dll",
+    );
+    const members = inspectManagedMembersBytes(bytes, binary);
+    expect(members.module?.name).toBe("");
+    const projected = projectManagedApplicationGraphEvidence({
+      managed_members: createEvidence(binary, MANAGED_STATIC_PROVIDER, {
+        operation: "inspect_managed_members",
+        parameters: {},
+        result: members,
+        rawResult: null,
+        limitations: members.limitations,
+        locations: [{ kind: "artifact-path", path: binary.path }],
+      }),
+    });
+    if (!projected.ok) throw projected.error;
+    const graph = parseJavaScriptApplicationGraph(
+      managedApplicationGraphResultSchema.parse(
+        parseEvidence(projected.value).normalized_result,
+      ).graph,
+    );
+    expect(
+      graph.nodes.find(({ kind }) => kind === "managed-module")
+        ?.observations[0],
+    ).toMatchObject({ label: null, properties: { name: "" } });
+    expect(graph.nodes.map(({ kind }) => kind)).toEqual(
+      expect.arrayContaining([
+        "managed-module",
+        "managed-type",
+        "managed-method",
+        "managed-field",
+      ]),
+    );
+  });
 });
 
 it("normalizes MVID casing for node identity while preserving observed values", () => {
@@ -506,6 +551,50 @@ describe("managed application graph token scope", () => {
     expect(JSON.stringify(wrongArtifact.error)).toContain(
       "token scope SHA-256",
     );
+  });
+
+  it.each([
+    "module identity absent",
+    "module MVID unknown",
+    "token scope MVID unknown",
+  ] as const)("rejects inconsistent identity when %s", (variant) => {
+    const { memberEvidence, boundaryEvidence } = createManagedInteropEvidence();
+    const members = managedMemberInspectionSchema.parse(
+      parseEvidence(memberEvidence).normalized_result,
+    );
+    if (members.module === null || members.module.mvid === null)
+      throw new Error("Expected fixture module identity and MVID");
+    const module =
+      variant === "module identity absent"
+        ? null
+        : variant === "module MVID unknown"
+          ? { ...members.module, mvid: null }
+          : members.module;
+    const identity_scope =
+      variant === "token scope MVID unknown"
+        ? { ...members.identity_scope, requires_mvid: null }
+        : members.identity_scope;
+    const inconsistentMembers = createEvidence(
+      undefined,
+      MANAGED_STATIC_PROVIDER,
+      {
+        operation: "inspect_managed_members",
+        parameters: {},
+        result: { ...members, module, identity_scope },
+        rawResult: null,
+        limitations: members.limitations,
+      },
+    );
+
+    const projected = projectManagedApplicationGraphEvidence({
+      managed_members: inconsistentMembers,
+      managed_native_boundaries: boundaryEvidence,
+    });
+
+    expect(projected.ok).toBe(false);
+    if (projected.ok)
+      throw new Error("An inconsistent token scope was accepted");
+    expect(JSON.stringify(projected.error)).toContain("token scope MVID");
   });
 });
 

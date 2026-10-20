@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -12,7 +12,10 @@ import {
 
 import { readClientRegistrationStatuses } from "../../../src/application/ClientRegistrationStatus.js";
 import { npxRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
-import { configureClientConfiguration } from "../../../src/application/SetupClientConfiguration.js";
+import {
+  configureClientConfiguration,
+  inspectClientConfiguration,
+} from "../../../src/application/SetupClientConfiguration.js";
 import {
   clientSkillDirectories,
   supportedClients,
@@ -34,28 +37,76 @@ const dshClient = (
   env: Parameters<typeof supportedClients>[2],
   platform: NodeJS.Platform = "linux",
 ) =>
-  supportedClients(join("/home/a"), platform, env).find(
+  supportedClients(resolve("/home/a"), platform, env).find(
     ({ name }) => name === "dsh",
   );
 
 describe("DeepSeek Harness configuration paths", () => {
+  it.each([
+    [undefined, ".dsh", ".agents", "shared"],
+    ["", ".dsh", ".agents", "shared"],
+    [" \t ", ".dsh", ".agents", "shared"],
+    ["~", "", "", "dsh"],
+    ["~/selected home", "selected home", "selected home", "dsh"],
+    ["~\\selected home", "selected home", "selected home", "dsh"],
+  ] as const)(
+    "resolves Harness and agents roots for %j",
+    (override, dshRoot, agentsRoot, client) => {
+      const home = resolve("/home/a");
+      const environment = { DSH_HOME: override, DSH_AGENTS_HOME: override };
+      expect(
+        supportedClients(home, process.platform, environment).find(
+          ({ name }) => name === "dsh",
+        ),
+      ).toMatchObject({
+        configPath: join(home, dshRoot, "cordis.patch.yml"),
+        markerPath: join(home, dshRoot),
+      });
+      expect(clientSkillDirectories(home, ["dsh"], environment)).toEqual([
+        { client, directory: join(home, agentsRoot, "skills") },
+      ]);
+    },
+  );
+
+  it.each(["relative home", "  literal home  ", "~someone"])(
+    "resolves a literal root %j relative to cwd without trimming it",
+    (override) => {
+      const home = resolve("/home/a");
+      const root = resolve(override);
+      const environment = { DSH_HOME: override, DSH_AGENTS_HOME: override };
+      expect(
+        supportedClients(home, process.platform, environment).find(
+          ({ name }) => name === "dsh",
+        ),
+      ).toMatchObject({
+        configPath: join(root, "cordis.patch.yml"),
+        markerPath: root,
+      });
+      expect(clientSkillDirectories(home, ["dsh"], environment)).toEqual([
+        { client: "dsh", directory: join(root, "skills") },
+      ]);
+    },
+  );
+
   it("resolves the home Cordis patch under the Harness home", () => {
     expect(dshClient({})).toEqual({
       name: "dsh",
       displayName: "DeepSeek Harness",
-      configPath: join("/home/a", ".dsh", "cordis.patch.yml"),
-      markerPath: join("/home/a", ".dsh"),
+      configPath: resolve("/home/a", ".dsh", "cordis.patch.yml"),
+      markerPath: resolve("/home/a", ".dsh"),
       format: "dsh",
     });
     // The home patch applies to every profile; DSH_HOME relocates it.
     expect(dshClient({ DSH_HOME: "/custom/harness" })?.configPath).toBe(
-      join("/custom/harness", "cordis.patch.yml"),
+      resolve("/custom/harness", "cordis.patch.yml"),
     );
     expect(
       clientSkillDirectories(join("/home/a"), ["dsh"], {
         DSH_AGENTS_HOME: "/custom/agents",
       }),
-    ).toEqual([{ client: "dsh", directory: join("/custom/agents", "skills") }]);
+    ).toEqual([
+      { client: "dsh", directory: resolve("/custom/agents", "skills") },
+    ]);
   });
 });
 
@@ -398,18 +449,134 @@ describe("DeepSeek Harness repair boundaries", () => {
     ]);
   });
 
-  it("refuses a group-targeted insertion whose applicability is unknown", async () => {
+  it("keeps group-targeted ownership for uninstall while setup rejects unknown activity", async () => {
     const { home, client } = await harnessClient();
     const initial = stringifyYaml([
-      { id: "missing-group", insert: [canonicalEntry()] },
+      {
+        id: "tools",
+        insert: [
+          canonicalEntry(),
+          { id: "foreign-peer", name: "caller-plugin", config: { keep: true } },
+        ],
+      },
     ]);
     await writeFile(client.configPath, initial);
+    expect(await inspectClientConfiguration(client, {}, command)).toMatchObject(
+      {
+        status: "invalid",
+        remediation: expect.stringContaining("targets a group"),
+      },
+    );
     expect(
       (await configureClientConfiguration(client, {}, command)).status,
     ).toBe("failed");
-    expect(await dshStatus(home)).not.toMatchObject({ state: "aligned" });
+    expect(await dshStatus(home)).toMatchObject({
+      state: "stale",
+      command: [...command],
+    });
     expect(await readFile(client.configPath, "utf8")).toBe(initial);
+    const host = systemUninstallHost(home);
+    expect(await host.inspectClient(client)).toBeUndefined();
+    expect((await host.removeClient(client)).status).toBe("removed");
+    expect(parseYaml(await readFile(client.configPath, "utf8"))).toEqual([
+      {
+        id: "tools",
+        insert: [
+          { id: "foreign-peer", name: "caller-plugin", config: { keep: true } },
+        ],
+      },
+    ]);
+    expect(await readFile(`${client.configPath}.rea.backup`, "utf8")).toBe(
+      initial,
+    );
   });
+
+  it("blocks malformed literal patches but still uninstalls a known owned sibling", async () => {
+    const { home, client } = await harnessClient();
+    const initial = stringifyYaml([
+      { insert: [canonicalEntry()] },
+      "foreign-invalid-row",
+    ]);
+    await writeFile(client.configPath, initial);
+
+    expect(await inspectClientConfiguration(client, {}, command)).toMatchObject(
+      {
+        status: "invalid",
+        remediation: expect.stringContaining("Malformed Cordis patches"),
+      },
+    );
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("failed");
+    expect(await readFile(client.configPath, "utf8")).toBe(initial);
+
+    const host = systemUninstallHost(home);
+    expect(await host.inspectClient(client)).toBeUndefined();
+    expect((await host.removeClient(client)).status).toBe("removed");
+    expect(parseYaml(await readFile(client.configPath, "utf8"))).toEqual([
+      "foreign-invalid-row",
+    ]);
+  });
+
+  it.each(["{ id: rea-mcp }", "7", "false", "''", "[null]"])(
+    "blocks a non-list literal insert value %s before setup edits the file",
+    async (insert) => {
+      const { client } = await harnessClient();
+      const initial = `- insert: ${insert}\n`;
+      await writeFile(client.configPath, initial);
+
+      expect(
+        await inspectClientConfiguration(client, {}, command),
+      ).toMatchObject({
+        status: "invalid",
+        remediation: expect.stringContaining("Malformed Cordis patches"),
+      });
+      expect(
+        (await configureClientConfiguration(client, {}, command)).status,
+      ).toBe("failed");
+      expect(await readFile(client.configPath, "utf8")).toBe(initial);
+    },
+  );
+
+  it("keeps Harness's null insert no-op editable", async () => {
+    const { client } = await harnessClient();
+    await writeFile(client.configPath, "- insert: null\n");
+
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("configured");
+  });
+});
+
+describe("DeepSeek Harness expression-backed structure", () => {
+  it.each([
+    `- !!js process.env.DSH_PATCH\n`,
+    `- insert: !!js process.env.DSH_ROWS\n`,
+    `- insert: [!!js process.env.DSH_ROW]\n`,
+  ])(
+    "retains dynamic insertion structure without appending or removing rows: %s",
+    async (initial) => {
+      const { home, client } = await harnessClient();
+      await writeFile(client.configPath, initial);
+      expect(await dshStatus(home)).toMatchObject({ state: "invalid" });
+      expect(
+        await inspectClientConfiguration(client, {}, command),
+      ).toMatchObject({
+        status: "invalid",
+        remediation: expect.stringContaining("unknown structure"),
+      });
+      expect(
+        (await configureClientConfiguration(client, {}, command)).status,
+      ).toBe("failed");
+      expect(await readFile(client.configPath, "utf8")).toBe(initial);
+      const host = systemUninstallHost(home);
+      expect((await host.removeClient(client)).status).toBe("retained");
+      expect(await readFile(client.configPath, "utf8")).toBe(initial);
+      await expect(
+        readFile(`${client.configPath}.rea.backup`, "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 });
 
 describe("DeepSeek Harness registration state", () => {
@@ -993,7 +1160,7 @@ describe("DeepSeek Harness alias targets", () => {
     const { client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- insert: &rows
+      `- holder: &rows
     - id: other-tool
       name: other
       config:
@@ -1015,7 +1182,7 @@ describe("DeepSeek Harness alias targets", () => {
     const text = await readFile(client.configPath, "utf8");
     expect(text).toContain("other-tool");
     expect(text).not.toContain("*rows");
-    expect(text).not.toContain("stale-launcher");
+    expect(text).toContain("stale-launcher");
     const patches = parseYaml(text) as { insert?: { id?: string }[] }[];
     expect(
       patches.flatMap(({ insert }) =>
@@ -1063,11 +1230,11 @@ describe("DeepSeek Harness alias targets", () => {
 });
 
 describe("DeepSeek Harness alias identity", () => {
-  it("keeps unrelated rows when the insert list is anchored outside an operation", async () => {
+  it("keeps unrelated rows when a valid insertion list is aliased", async () => {
     const { client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- &rows
+      `- holder: &rows
   - id: other-tool
     name: other
     config:
@@ -1107,7 +1274,8 @@ describe("DeepSeek Harness alias identity", () => {
     const { client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- &expr !!js process.env.TOKEN
+      `- insert: []
+  callerExpression: &expr !!js process.env.TOKEN
 - insert:
     - id: rea-mcp
       name: "@deepseek-ai/dsh-mcp-client"
@@ -1137,7 +1305,8 @@ describe("DeepSeek Harness alias identity", () => {
     const { home, client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- &entryId rea-mcp
+      `- insert: []
+  holder: &entryId rea-mcp
 - insert:
     - id: *entryId
       name: "@deepseek-ai/dsh-mcp-client"
@@ -1201,7 +1370,8 @@ describe("DeepSeek Harness alias cleanup", () => {
     const { home, client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- &expr !!js process.env.GHIDRA_INSTALL_DIR
+      `- insert: []
+  callerExpression: &expr !!js process.env.GHIDRA_INSTALL_DIR
 - insert:
     - id: rea-mcp
       name: "@deepseek-ai/dsh-mcp-client"
@@ -1475,46 +1645,11 @@ describe("DeepSeek Harness alias anchors", () => {
     ).toBe("unchanged");
   });
 
-  it("edits a root alias whose insert list is itself an alias", async () => {
-    const { client } = await harnessClient();
-    await writeFile(
-      client.configPath,
-      `- &rows
-  - id: other-tool
-    name: other
-    config:
-      command: keep-me
-  - id: rea-mcp
-    name: "@deepseek-ai/dsh-mcp-client"
-    config:
-      serverName: rea
-      transport: stdio
-      command: stale-launcher
-      args: [mcp]
-- holder: &op
-    insert: *rows
-- *op
-`,
-    );
-
-    expect(
-      (await configureClientConfiguration(client, {}, command)).status,
-    ).toBe("configured");
-    const inserted = loadedInserts(await readFile(client.configPath, "utf8"));
-    expect(inserted.filter((entry) => entry.id === "other-tool")).toHaveLength(
-      1,
-    );
-    expect(inserted.filter((entry) => entry.id === "rea-mcp")).toHaveLength(1);
-    expect(
-      (await configureClientConfiguration(client, {}, command)).status,
-    ).toBe("unchanged");
-  });
-
   it("drops a replayed root alias after its insert alias is emptied", async () => {
     const { home, client } = await harnessClient();
     await writeFile(
       client.configPath,
-      `- &rows
+      `- holder: &rows
   - id: rea-mcp
     name: "@deepseek-ai/dsh-mcp-client"
     config:
@@ -1568,6 +1703,119 @@ const dshStatus = async (home: string) =>
       environment: {},
     })
   ).find(({ client }) => client === "dsh");
+
+describe("DeepSeek Harness runtime environment validation", () => {
+  it.each([
+    ["HOPPER_LOADER_ARGS_JSON", "{"],
+    ["REA_REFERENCE_SECRET_PATTERNS_JSON", '[""]'],
+    ["REA_GHIDRA_COMPILER_SPEC_ID", "borlandcpp"],
+  ])("refuses invalid literal %s before writing", async (setting, value) => {
+    const { home, client } = await harnessClient();
+    const entry = canonicalEntry();
+    const original = stringifyYaml([
+      {
+        insert: [
+          { ...entry, config: { ...entry.config, env: { [setting]: value } } },
+        ],
+      },
+    ]);
+    await writeFile(client.configPath, original);
+    expect(await inspectClientConfiguration(client, {}, command)).toMatchObject(
+      { status: "invalid", remediation: expect.stringContaining(setting) },
+    );
+    expect(await dshStatus(home)).toMatchObject({
+      state: "invalid",
+      remediation: expect.stringContaining(setting),
+    });
+    expect(
+      await configureClientConfiguration(client, {}, command),
+    ).toMatchObject({ status: "failed" });
+    expect(await readFile(client.configPath, "utf8")).toBe(original);
+    await expect(
+      access(`${client.configPath}.rea.backup`),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps an expression-backed companion unknown until a literal override replaces it", async () => {
+    const { home, client } = await harnessClient();
+    const entry = canonicalEntry();
+    const document = parseDocument(
+      stringifyYaml([
+        {
+          insert: [
+            {
+              ...entry,
+              config: {
+                ...entry.config,
+                command: "stale",
+                env: {
+                  REA_GHIDRA_COMPILER_SPEC_ID: "borlandcpp",
+                  CALLER_SETTING: "keep",
+                },
+              },
+            },
+          ],
+        },
+      ]),
+    );
+    for (const setting of [
+      "REA_GHIDRA_LANGUAGE_ID",
+      "HOPPER_LOADER_ARGS_JSON",
+    ]) {
+      const expression = document.createNode(`process.env.${setting}`);
+      expression.tag = "tag:yaml.org,2002:js";
+      document.setIn([0, "insert", 0, "config", "env", setting], expression);
+    }
+    const original = document.toString();
+    await writeFile(client.configPath, original);
+    expect(await inspectClientConfiguration(client, {}, command)).toMatchObject(
+      { status: "update" },
+    );
+    expect(
+      await configureClientConfiguration(client, {}, command),
+    ).toMatchObject({ status: "configured" });
+    const configured = await readFile(client.configPath, "utf8");
+    expect(configured).toContain("!!js process.env.REA_GHIDRA_LANGUAGE_ID");
+    expect(configured).toContain("!!js process.env.HOPPER_LOADER_ARGS_JSON");
+    expect(configured).toContain("CALLER_SETTING: keep");
+    expect(await dshStatus(home)).toMatchObject({ state: "aligned" });
+    expect(
+      await configureClientConfiguration(client, {}, command),
+    ).toMatchObject({ status: "unchanged" });
+    await expect(
+      inspectClientConfiguration(
+        client,
+        { HOPPER_LOADER_ARGS_JSON: "{" },
+        command,
+      ),
+    ).rejects.toMatchObject({
+      settings: [{ setting: "HOPPER_LOADER_ARGS_JSON" }],
+    });
+    await expect(
+      inspectClientConfiguration(
+        client,
+        { REA_GHIDRA_LANGUAGE_ID: "" },
+        command,
+      ),
+    ).rejects.toMatchObject({
+      settings: [{ setting: "REA_GHIDRA_LANGUAGE_ID" }],
+    });
+    expect(
+      await inspectClientConfiguration(
+        client,
+        {
+          REA_GHIDRA_LANGUAGE_ID: "x86:LE:32:default",
+          HOPPER_LOADER_ARGS_JSON: '[""]',
+        },
+        command,
+      ),
+    ).toMatchObject({ status: "update" });
+    expect(await readFile(client.configPath, "utf8")).toBe(configured);
+    expect(await readFile(`${client.configPath}.rea.backup`, "utf8")).toBe(
+      original,
+    );
+  });
+});
 
 describe("DeepSeek Harness source ownership", () => {
   it.each(["setup", "uninstall"])(
@@ -1866,7 +2114,7 @@ describe("DeepSeek Harness ownership and editability", () => {
       );
       const initial = yaml.toString();
       await writeFile(client.configPath, initial);
-      expect(await dshStatus(home)).toMatchObject({ state: "invalid" });
+      expect(await dshStatus(home)).toMatchObject({ state: "stale" });
       expect(
         (await configureClientConfiguration(client, {}, command)).status,
       ).toBe("failed");
@@ -2059,4 +2307,136 @@ describe("DeepSeek Harness caller node metadata", () => {
       );
     },
   );
+});
+
+describe("DeepSeek Harness uninstall of a shared operation", () => {
+  it("keeps a group patch's own fields and comment when its only row was REA's", async () => {
+    const { home, client } = await harnessClient();
+    const entry = canonicalEntry();
+    await writeFile(
+      client.configPath,
+      `- insert:
+    - id: user-a
+      name: plugin-a
+# caller group patch
+- id: tools
+  config:
+    sandbox: strict
+  insert:
+    - id: rea-mcp
+      name: "${entry.name}"
+      config:
+        serverName: rea
+        transport: stdio
+        command: ${entry.config.command}
+        args: ${JSON.stringify(entry.config.args)}
+`,
+    );
+
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    const text = await readFile(client.configPath, "utf8");
+    expect(parseYaml(text)).toEqual([
+      { insert: [{ id: "user-a", name: "plugin-a" }] },
+      { id: "tools", config: { sandbox: "strict" } },
+    ]);
+    expect(text).toContain("# caller group patch");
+  });
+
+  it("keeps an operation's own fields when setup removes a second REA row from it", async () => {
+    // Setup refuses a REA row in a group patch, so the setup path meets the
+    // keep rule only on an operation without a selector.
+    const { home, client } = await harnessClient();
+    const entry = canonicalEntry();
+    const row = (launcher: string) => `    - id: rea-mcp
+      name: "${entry.name}"
+      config:
+        serverName: rea
+        transport: stdio
+        command: ${launcher}
+        args: [mcp]
+`;
+    await writeFile(
+      client.configPath,
+      `- insert:
+${row("first-launcher")}# caller operation
+- disabled: false
+  insert:
+${row("second-launcher")}`,
+    );
+
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("configured");
+    const text = await readFile(client.configPath, "utf8");
+    expect(text).toContain("# caller operation");
+    expect(loadedInserts(text)).toHaveLength(1);
+    expect((parseYaml(text) as unknown[]).at(-1)).toEqual({ disabled: false });
+    expect(await dshStatus(home)).toMatchObject({ state: "aligned" });
+  });
+
+  it("drops an emptied operation that targets REA's own row", async () => {
+    const { home, client } = await harnessClient();
+    await writeFile(
+      client.configPath,
+      stringifyYaml([
+        { insert: [{ id: "user-a", name: "plugin-a" }] },
+        {
+          id: "rea-mcp",
+          config: { serverName: "rea" },
+          insert: [canonicalEntry()],
+        },
+      ]),
+    );
+
+    const host = systemUninstallHost(home);
+    expect((await host.removeClient(client)).status).toBe("removed");
+    expect(parseYaml(await readFile(client.configPath, "utf8"))).toEqual([
+      { insert: [{ id: "user-a", name: "plugin-a" }] },
+    ]);
+  });
+
+  it.each([
+    { selector: { id: "tools" } },
+    { selector: { name: "tools" } },
+    { selector: { id: "tools", name: "tools" } },
+  ])(
+    "drops an emptied operation left with only its target selector $selector",
+    async ({ selector }) => {
+      const { home, client } = await harnessClient();
+      await writeFile(
+        client.configPath,
+        stringifyYaml([
+          { insert: [{ id: "user-a", name: "plugin-a" }] },
+          { ...selector, insert: [canonicalEntry()] },
+        ]),
+      );
+
+      expect(
+        (await systemUninstallHost(home).removeClient(client)).status,
+      ).toBe("removed");
+      expect(parseYaml(await readFile(client.configPath, "utf8"))).toEqual([
+        { insert: [{ id: "user-a", name: "plugin-a" }] },
+      ]);
+    },
+  );
+
+  it("still drops an insert-only operation that REA's row emptied", async () => {
+    const { home, client } = await harnessClient();
+    await writeFile(
+      client.configPath,
+      stringifyYaml([
+        { insert: [{ id: "user-a", name: "plugin-a" }] },
+        { insert: [canonicalEntry()] },
+      ]),
+    );
+
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    expect(parseYaml(await readFile(client.configPath, "utf8"))).toEqual([
+      { insert: [{ id: "user-a", name: "plugin-a" }] },
+    ]);
+  });
 });

@@ -1,3 +1,4 @@
+import { locateGodotPck } from "../GodotPckLocation.js";
 import { sameRegularFileState } from "../../filesystem/RegularFile.js";
 import type { FileHandle } from "node:fs/promises";
 import type { Stats } from "node:fs";
@@ -5,7 +6,8 @@ import type { StableRegularFileDescriptor } from "../../filesystem/RegularFile.j
 import type { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
 
 import { classifyArtifactContent } from "./ArtifactGraphConstruction.js";
-import { ARTIFACT_CLASSIFICATION_PREFIX_BYTES } from "../ArtifactHash.js";
+import { abortIfNeeded } from "../ArtifactHash.js";
+import { createArtifactClassificationProbe } from "../ArtifactClassificationProbe.js";
 import type { ArtifactOccurrence } from "../../domain/artifactGraph.js";
 import {
   hasZipSignature,
@@ -59,13 +61,9 @@ export const classifyAndHashRoot = async (
       };
       const cleanupAttempt = await options.resourceScope.release(owner);
       if (cleanupAttempt.kind === "failed")
-        throw ArtifactReaderFailure.withCleanup(
-          cleanupAttempt.cause,
-          ArtifactReaderFailure.cleanupObservation(
-            cleanupAttempt.cause,
-            owner.resource,
-          ),
-        );
+        throw options.resourceScope.cleanupFailure({ kind: "completed" }, [
+          cleanupAttempt,
+        ]);
     }
     return { format: result.format, digest: result.digest };
   });
@@ -104,7 +102,7 @@ export const classifyAndHashRootForInventory = async (
         "integrity",
         `Root artifact changed before inventory: ${path}`,
       );
-    const format = await classifyRootFormat(path, handle);
+    const format = await classifyRootFormat(path, handle, options.signal);
     const digest = await hashStableRootArtifactHandle(
       path,
       handle,
@@ -112,7 +110,9 @@ export const classifyAndHashRootForInventory = async (
       options.signal,
     );
     const retainSource =
-      isZipPackageFormat(format) || format === "mach-o-universal";
+      isZipPackageFormat(format) ||
+      format === "mach-o-universal" ||
+      format === "godot-pck";
     outcome = {
       kind: "completed",
       value: {
@@ -129,13 +129,7 @@ export const classifyAndHashRootForInventory = async (
   if (outcome.kind === "failed" || outcome.value.rootSource === undefined) {
     const cleanupAttempt = await options.resourceScope.release(owner);
     if (cleanupAttempt.kind === "failed")
-      throw ArtifactReaderFailure.withCleanup(
-        outcome.kind === "failed" ? outcome.cause : cleanupAttempt.cause,
-        ArtifactReaderFailure.cleanupObservation(
-          cleanupAttempt.cause,
-          owner.resource,
-        ),
-      );
+      throw options.resourceScope.cleanupFailure(outcome, [cleanupAttempt]);
   }
   if (outcome.kind === "failed") throw outcome.cause;
   return outcome.value;
@@ -144,21 +138,40 @@ export const classifyAndHashRootForInventory = async (
 const classifyRootFormat = async (
   path: string,
   handle: FileHandle,
+  signal?: AbortSignal,
 ): Promise<ArtifactOccurrence["artifact_format"]> => {
-  const magic = Buffer.alloc(ARTIFACT_CLASSIFICATION_PREFIX_BYTES);
-  const observed = await handle.read(magic, 0, magic.length, 0);
-  const prefix = magic.subarray(0, observed.bytesRead);
+  const probe = createArtifactClassificationProbe();
+  const chunk = Buffer.alloc(64 * 1024);
+  while (probe.length < probe.limit) {
+    abortIfNeeded(signal);
+    const read = await handle.read(
+      chunk,
+      0,
+      Math.min(chunk.length, probe.limit - probe.length),
+      probe.length,
+    );
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) break;
+    probe.write(chunk.subarray(0, read.bytesRead));
+  }
+  const archiveBytes = (await handle.stat()).size;
+  const evidence = probe.finish(archiveBytes);
+  abortIfNeeded(signal);
   const lower = path.toLowerCase();
-  if (hasZipSignature(prefix)) return zipRootPackageFormat(lower);
+  if (hasZipSignature(evidence.prefix)) return zipRootPackageFormat(lower);
   if (
     lower.endsWith(".pkg") &&
-    prefix.subarray(0, 4).toString("ascii") === "xar!"
+    evidence.prefix.subarray(0, 4).equals(Buffer.from("xar!"))
   )
     return "pkg";
-  if (lower.endsWith(".dmg") && (await hasKolyTrailer(handle))) return "dmg";
-  // ASAR is chosen from its header pickle; any other suffix is a role hint.
-  return classifyArtifactContent(path, prefix, (await handle.stat()).size)
-    .format;
+  if (
+    lower.endsWith(".dmg") &&
+    (await hasKolyTrailer(handle, archiveBytes, signal))
+  )
+    return "dmg";
+  if (await locateGodotPck(handle, archiveBytes, signal, evidence.prefix))
+    return "godot-pck";
+  return classifyArtifactContent(path, evidence, archiveBytes).format;
 };
 
 /** App Pack is a verified ZIP root role; nested .app members retain their observed format. */
@@ -167,10 +180,25 @@ const zipRootPackageFormat = (lower: string): ZipPackageFormat =>
     ? "app-pack"
     : (zipPackageFormatForPath(lower) ?? "zip");
 
-const hasKolyTrailer = async (handle: FileHandle): Promise<boolean> => {
-  const size = (await handle.stat()).size;
+const hasKolyTrailer = async (
+  handle: FileHandle,
+  size: number,
+  signal?: AbortSignal,
+): Promise<boolean> => {
   if (size < 512) return false;
   const trailer = Buffer.alloc(4);
-  const read = await handle.read(trailer, 0, trailer.length, size - 512);
-  return read.bytesRead === 4 && trailer.toString("ascii") === "koly";
+  let bytes = 0;
+  while (bytes < trailer.length) {
+    abortIfNeeded(signal);
+    const read = await handle.read(
+      trailer,
+      bytes,
+      trailer.length - bytes,
+      size - 512 + bytes,
+    );
+    abortIfNeeded(signal);
+    if (read.bytesRead === 0) return false;
+    bytes += read.bytesRead;
+  }
+  return trailer.equals(Buffer.from("koly"));
 };

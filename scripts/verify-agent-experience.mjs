@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   copyFile,
@@ -25,6 +26,7 @@ import {
   summarizeFactualCorrectness,
 } from "../dist/evaluation/AgentEvaluationReport.js";
 import { PRODUCT_IDENTITY } from "../dist/identity.js";
+import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -67,6 +69,7 @@ const evaluationEnvironment = {
   PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
 };
 
+let primaryError;
 try {
   const codexVersion = await readCommandVersion(codex);
   await Promise.all([
@@ -153,6 +156,18 @@ try {
       requiresEvidence: true,
       requiredAnswerTermGroups: [["profileapi"], ["profile:read"]],
       prompt: `請靜態分析已交付的 Electron 程式 ${targets.javascript}，說明 renderer 如何透過 preload 讀取 profile，以及 main handler 的關係。不要執行目標或安裝分析引擎；引用完整的產出 Evidence，保留 runtime 未知事項。`,
+    },
+    {
+      id: "notes-export",
+      expectedFirstTool: "analyze_javascript_application",
+      requiresEvidence: true,
+      requiredAnswerTermGroups: [],
+      requiredToolSubsequence: [
+        "analyze_javascript_application",
+        "trace_application_feature",
+        "trace_javascript_semantics",
+      ],
+      prompt: `Use REA on the shipped Electron application at ${targets.notesElectron} to investigate its notes export API, preload exposure and main handler. Do not read target files directly or launch Electron. Use the returned application Evidence to trace the exact notes:export IPC channel in both directions, then query semantic relations for the property invoke with forward influence, excluding ambiguous dynamic edges and without an expected sink. Report the selected static facts, source locations and coverage limits using the closed claim contract.`,
     },
     {
       id: "javascript-module-view",
@@ -259,7 +274,7 @@ try {
     const execution = await runCodex(
       answerInstructions.length === 0
         ? scenario.prompt
-        : `${scenario.prompt}\n\nThis closed factual rubric needs complete producer Evidence in the transcript. Request complete detail on each initial application analysis when supported; summary or view records alone are not accepted by this rubric.\n\n${answerInstructions}`,
+        : `${scenario.prompt}\n\nThis closed factual rubric needs complete producer Evidence in the transcript. Request complete detail on each initial inspection or analysis when supported; summary or view records alone are not accepted by this rubric.\n\n${answerInstructions}`,
       scenario.approvedTools ?? [],
     );
     const transcriptDirectory = process.env.REA_AGENT_EVAL_TRANSCRIPT_DIR;
@@ -378,11 +393,20 @@ try {
     throw new Error(
       `Agent routing/workflow/answer checks failed: ${failed.map(({ id }) => id).join(", ")}`,
     );
+} catch (cause) {
+  primaryError = cause;
+  throw cause;
 } finally {
   // Even a deliberately retained fixture directory must never retain auth.
-  await rm(authPath, { force: true });
-  if (process.env.REA_AGENT_EVAL_KEEP_FIXTURES !== "true")
-    await rm(evaluationRoot, { recursive: true, force: true });
+  await closeVerifierResources(
+    [
+      () => rm(authPath, { force: true }),
+      ...(process.env.REA_AGENT_EVAL_KEEP_FIXTURES === "true"
+        ? []
+        : [() => rm(evaluationRoot, { recursive: true, force: true })]),
+    ],
+    primaryError,
+  );
 }
 
 async function createTargets(root, includeManaged) {
@@ -440,6 +464,13 @@ async function createTargets(root, includeManaged) {
     ...fixtures,
     largeJavascript,
     managed: join(managedOutput, "AgentEval.dll"),
+    ...(includeManaged
+      ? {
+          managedSha256: createHash("sha256")
+            .update(await readFile(join(managedOutput, "AgentEval.dll")))
+            .digest("hex"),
+        }
+      : {}),
   };
 }
 

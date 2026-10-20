@@ -1,6 +1,23 @@
+import { nativeFunctionMatchingSchema } from "../domain/native/functionMatching.js";
+import { nativeFunctionMatchingSummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { nativeByteReadSchema } from "../domain/native/nativeByteRead.js";
+import { analysisDetailOutputSchemaOf } from "./analysisDetail.js";
+import { nativeInventorySummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { nativeInventoryRowsSchemas } from "../domain/native/nativeInventory.js";
 import { z } from "zod";
+import { byteSearchResultSchema } from "../domain/native/bytePattern.js";
+import {
+  artifactInventorySummaryViewResultSchema,
+  interfaceBuilderSummaryViewResultSchema,
+  machoSummaryViewResultSchema,
+  managedArtifactSummaryViewResultSchema,
+  managedMemberSummaryViewResultSchema,
+} from "../domain/analysisView/analysisView.js";
 import { evidenceBundleSummarySchema } from "../domain/evidenceRecordSummary.js";
-import { BINARY_ARCHITECTURES } from "../domain/binaryTargetTypes.js";
+import {
+  BINARY_ARCHITECTURES,
+  RAW_ONLY_ARCHITECTURES,
+} from "../domain/binaryTargetTypes.js";
 import {
   binaryArchitectureSchema,
   rawBinaryEntryPointSchema,
@@ -25,7 +42,6 @@ import {
   functionInstructionWindowSchema,
   referenceEdgeSchema,
   unresolvedCallSchema,
-  analysisStringSchema,
   procedureIdentitySchema,
 } from "../domain/hopperValues.js";
 import { nativeApiInspectionResultSchema } from "../domain/native/nativeApiBoundary.js";
@@ -64,7 +80,6 @@ import { nativeDispatchMetadataResultSchema } from "../domain/native/objcSwiftMe
 import { nativeInvestigationTraceSchema } from "../domain/native/nativeInvestigationGraph.js";
 import {
   addressList,
-  addressedValue,
   addressedEntry,
   containingProcedureResolution,
   functionDossierOutput,
@@ -81,6 +96,7 @@ import {
 } from "./toolOutputSchemaPrimitives.js";
 
 import { processCaptureSchema } from "../domain/process/processCapture.js";
+import { electronFuseReportSchema } from "../domain/electron/electronFuses.js";
 const contextFacetSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("available"), value: jsonValueSchema }),
   z.object({
@@ -103,6 +119,7 @@ const bookmarkFacetSchema = z.discriminatedUnion("state", [
 
 /** Exact structured-content schemas shared by direct analysis providers. */
 export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
+  search_bytes: evidenceResultOf(byteSearchResultSchema),
   annotate_native_function: evidenceResultOf(nativeFunctionAnnotationsSchema),
   inspect_native_load_image: evidenceResultOf(nativeLoadImageSchema),
   inspect_native_data_type: evidenceResultOf(nativeDataTypeSchema),
@@ -117,10 +134,25 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   inline_comment: evidenceResultOf(nullableText),
   list_bookmarks: evidenceResultOf(z.array(analysisBookmarkSchema)),
   list_documents: evidenceResultOf(z.array(z.string())),
-  list_names: evidenceResultOf(z.array(addressedValue)),
-  list_procedures: evidenceResultOf(z.array(addressedValue)),
+  list_names: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.names,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_names"),
+    }),
+  ),
+  list_procedures: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.names,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_procedures"),
+    }),
+  ),
   list_segments: segmentOutput,
-  list_strings: evidenceResultOf(z.array(analysisStringSchema)),
+  list_strings: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.strings,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_strings"),
+    }),
+  ),
   next_address: evidenceResultOf(z.string()),
   prev_address: evidenceResultOf(z.string()),
   procedure_address: evidenceResultOf(z.string()),
@@ -129,15 +161,7 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   procedure_callers: evidenceResultOf(addressList),
   procedure_info: procedureInfoOutput,
   read_function_instructions: evidenceResultOf(functionInstructionWindowSchema),
-  read_bytes: evidenceResultOf(
-    z.object({
-      address: z.string(),
-      requested_bytes: z.number().int().min(1),
-      returned_bytes: z.number().int().min(0),
-      bytes_hex: z.string().regex(/^(?:[a-f0-9]{2})*$/u),
-      complete: z.boolean(),
-    }),
-  ),
+  read_bytes: evidenceResultOf(nativeByteReadSchema),
   address_to_file_offset: evidenceResultOf(
     z.object({
       address: z.string(),
@@ -179,10 +203,19 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   ),
   procedure_pseudo_code: evidenceResultOf(nullableText),
   resolve_containing_procedure: evidenceResultOf(containingProcedureResolution),
-  search_procedures: evidenceResultOf(
+  search_procedures: analysisDetailOutputSchemaOf(
     z.array(z.object({ address: z.string(), value: z.string() })),
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("search_procedures"),
+    }),
   ),
-  search_strings: evidenceResultOf(z.array(analysisStringSchema)),
+
+  search_strings: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.strings,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("search_strings"),
+    }),
+  ),
   set_address_name: evidenceResultOf(z.boolean()),
   set_addresses_names: evidenceResultOf(z.record(z.string(), z.boolean())),
   set_bookmark: evidenceResultOf(z.boolean()),
@@ -220,7 +253,7 @@ const callPathTraceOutput = evidenceResultOf(
     start: z.string(),
     goal: z.string().nullable(),
     direction: z.enum(["forward", "backward"]),
-    goal_status: z.enum(["not_requested", "reached", "not_reached"]),
+    goal_status: z.enum(["not_requested", "reached", "not_reached", "unknown"]),
     nodes: z.array(
       z.object({
         address: z.string(),
@@ -352,15 +385,20 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   binary_overview: evidenceResultOf(
     z.object({
       document: z.string(),
-      segments: z.array(
-        z.object({
-          name: z.string(),
-          start: z.string(),
-          end: z.string(),
-          length: z.number().min(0),
-        }),
-      ),
-      segment_count: z.number().int().min(0),
+      image_base: z.string().min(1).optional(),
+      segments: z
+        .array(
+          z.object({
+            name: z.string(),
+            start: z.string(),
+            end: z.string(),
+            length: z.number().min(0).nullable(),
+            image_base: z.string().exactOptional(),
+            address_space: z.string().exactOptional(),
+          }),
+        )
+        .optional(),
+      segment_count: z.number().int().min(0).optional(),
       procedure_count: z.number().int().min(0),
       string_count: z.number().int().min(0),
     }),
@@ -376,7 +414,9 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   observe_native_ui: evidenceResultOf(nativeUiResultSchema),
   capture_native_ui_scenario: evidenceResultOf(nativeUiResultSchema),
   observe_native_calls: evidenceResultOf(nativeCallObservationResultSchema),
-  inspect_macho: evidenceResultOf(inspectMachoSchema),
+  inspect_macho: evidenceResultOf(
+    z.union([inspectMachoSchema, machoSummaryViewResultSchema]),
+  ),
   inspect_signature: evidenceResultOf(inspectSignatureSchema),
   inspect_plist: evidenceResultOf(inspectPlistSchema),
   list_architectures: evidenceResultOf(listArchitecturesSchema),
@@ -385,9 +425,19 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
 
 /** Exact Evidence schemas for provider-neutral artifact graph operations. */
 export const artifactOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
-  inspect_artifact: evidenceResultOf(artifactInspectionResultSchema),
+  inspect_artifact: evidenceResultOf(
+    z.union([
+      artifactInspectionResultSchema,
+      artifactInventorySummaryViewResultSchema,
+    ]),
+  ),
   extract_artifact: evidenceResultOf(artifactExtractionResultSchema),
-  decode_interface_builder: evidenceResultOf(interfaceBuilderAnalysisSchema),
+  decode_interface_builder: evidenceResultOf(
+    z.union([
+      interfaceBuilderAnalysisSchema,
+      interfaceBuilderSummaryViewResultSchema,
+    ]),
+  ),
   inspect_keyed_archive: evidenceResultOf(keyedArchiveResultSchema),
   inspect_asset_catalog: evidenceResultOf(appleAssetCatalogResultSchema),
   trace_dylib_resolution: evidenceResultOf(dylibResolutionResultSchema),
@@ -395,8 +445,18 @@ export const artifactOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
 
 /** Exact Evidence schema for execution-free managed static analysis. */
 export const managedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
-  inspect_managed_artifact: evidenceResultOf(managedArtifactInspectionSchema),
-  inspect_managed_members: evidenceResultOf(managedMemberInspectionSchema),
+  inspect_managed_artifact: evidenceResultOf(
+    z.union([
+      managedArtifactInspectionSchema,
+      managedArtifactSummaryViewResultSchema,
+    ]),
+  ),
+  inspect_managed_members: evidenceResultOf(
+    z.union([
+      managedMemberInspectionSchema,
+      managedMemberSummaryViewResultSchema,
+    ]),
+  ),
   inspect_managed_native_boundaries: evidenceResultOf(
     managedNativeBoundaryInspectionSchema,
   ),
@@ -424,11 +484,14 @@ const lifecycleTargetFields = {
   path: z.string(),
   kind: targetKindSchema,
   sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-  architecture: z.enum(BINARY_ARCHITECTURES).nullable(),
 };
 const detectedLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
   format: targetFormatSchema.exclude(["raw-binary"]),
+  architecture: z
+    .enum(BINARY_ARCHITECTURES)
+    .exclude([...RAW_ONLY_ARCHITECTURES])
+    .nullable(),
 });
 const rawLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
@@ -527,6 +590,12 @@ export const sessionOutputSchemas = {
   compare_process_captures: evidenceResultOf(processCaptureComparisonSchema),
   compare_artifacts: evidenceResultOf(artifactComparisonResultSchema),
   compare_functions: evidenceResultOf(functionComparisonResultSchema),
+  match_native_functions: evidenceResultOf(
+    z.union([
+      nativeFunctionMatchingSchema,
+      nativeFunctionMatchingSummaryViewResultSchema,
+    ]),
+  ),
   compare_bundles: evidenceResultOf(bundleComparisonResultSchema),
   find_changed_behavior: evidenceResultOf(changedBehaviorResultSchema),
   build_call_path: evidenceResultOf(callPathResultSchema),
@@ -540,6 +609,8 @@ export const sessionOutputSchemas = {
     z.object({
       items: z.array(residualUnknownSchema),
       total: z.number().int().min(0),
+      offset: z.number().int().min(0),
+      next_offset: z.number().int().min(0).nullable(),
     }),
   ),
   record_unknown: lifecycleResultOf(residualUnknownSchema),
@@ -552,3 +623,8 @@ export const sessionOutputSchemas = {
     }),
   ),
 } satisfies Readonly<Record<string, z.ZodObject>>;
+
+/** Exact Evidence schema for read-only Electron fuse inspection. */
+export const electronFuseOutputSchemas = {
+  inspect_electron_fuses: evidenceResultOf(electronFuseReportSchema),
+};

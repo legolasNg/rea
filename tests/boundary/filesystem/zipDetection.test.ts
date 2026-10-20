@@ -16,6 +16,7 @@ import {
 import { parseBinaryTarget } from "../../../src/application/BinaryTargetResolver.js";
 import { artifactOccurrenceAt } from "../../fixtures/artifactEntryOrder.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { asarHeaderBytes } from "../../fixtures/asarHeader.js";
 
 describe("ZIP signature detection", () => {
   it.each([
@@ -65,30 +66,8 @@ describe("ZIP signature detection", () => {
     const textPkg = join(root, "notes.pkg");
     const dmg = join(root, "image.dmg");
     const textDmg = join(root, "notes.dmg");
-    const headerSize = 20;
-    await writeFile(
-      asar,
-      Buffer.from([
-        4,
-        0,
-        0,
-        0,
-        headerSize,
-        0,
-        0,
-        0,
-        headerSize - 4,
-        0,
-        0,
-        0,
-        2,
-        0,
-        0,
-        0,
-        0x7b,
-        0x7d,
-      ]),
-    );
+    const asarBytes = asarHeaderBytes(JSON.stringify({ files: {} }));
+    await writeFile(asar, asarBytes);
     await writeFile(textAsar, Buffer.from("not an asar"));
     await writeFile(pkg, Buffer.from("xar!"));
     await writeFile(textPkg, Buffer.from("not a pkg"));
@@ -102,6 +81,11 @@ describe("ZIP signature detection", () => {
     expect(
       (await classifyAndHashRoot(textAsar, false, await lstat(textAsar)))
         .format,
+    ).toBe("file");
+    // A valid prefix cannot admit extents outside the observed container.
+    await writeFile(asar, asarBytes.subarray(0, -1));
+    expect(
+      (await classifyAndHashRoot(asar, false, await lstat(asar))).format,
     ).toBe("file");
     expect(
       (await classifyAndHashRoot(pkg, false, await lstat(pkg))).format,
@@ -196,6 +180,41 @@ describe("nested container family", () => {
         artifact_kind: "container",
         artifact_format: "apk",
       });
+    },
+  );
+});
+
+describe("package signature byte identity", () => {
+  it.each([
+    { extension: "pkg", signature: "xar!", offset: 0, size: 4 },
+    { extension: "dmg", signature: "koly", offset: 0, size: 512 },
+  ])(
+    "rejects high-bit aliases of $extension magic at both admission boundaries",
+    async ({ extension, signature, offset, size }) => {
+      const root = await createTestTempDirectory("rea-package-magic-");
+      const path = join(root, `input.${extension}`);
+      const bytes = Buffer.alloc(size);
+      bytes.write(signature, offset, "ascii");
+      await writeFile(path, bytes);
+      expect(
+        (await classifyAndHashRoot(path, false, await lstat(path))).format,
+      ).toBe(extension);
+      expect(await parseBinaryTarget(path)).toMatchObject({
+        ok: true,
+        value: { format: extension },
+      });
+      for (let index = 0; index < signature.length; index += 1) {
+        const changed = Buffer.from(bytes);
+        changed[offset + index] = changed[offset + index]! | 0x80;
+        await writeFile(path, changed);
+        expect(
+          (await classifyAndHashRoot(path, false, await lstat(path))).format,
+        ).toBe("file");
+        expect(await parseBinaryTarget(path)).toMatchObject({
+          ok: false,
+          error: { _tag: "BinaryTargetError" },
+        });
+      }
     },
   );
 });

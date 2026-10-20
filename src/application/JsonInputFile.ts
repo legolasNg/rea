@@ -11,6 +11,8 @@ import streamValues from "stream-json/streamers/stream-values.js";
 import streamArray from "stream-json/streamers/stream-array.js";
 
 import { RegularFileChangedError } from "../filesystem/RegularFile.js";
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
+import { sealOwnedJsonInput } from "./OwnedJsonInput.js";
 import { withRegularFile } from "./RegularFileRead.js";
 import {
   JSON_BYTE_ORDER_MARK_MESSAGE,
@@ -32,13 +34,20 @@ const PACKED_TOKEN_PART_CODE_UNITS = 64 * 1024;
 // This selects an implementation; larger files remain accepted through streaming.
 const NATIVE_PARSE_READ_BUDGET = 8 * 1024 * 1024;
 
-/** Keep native parsing only when input copies and value expansion fit live headroom. */
-const nativeParseFits = (inputBytes: number): boolean =>
-  inputBytes <= NATIVE_PARSE_READ_BUDGET &&
+/** Heap a whole-file native JSON.parse may need: the assembler's 64x container expansion plus byte and text copies. */
+export const nativeJsonParseRequiredBytes = (
+  inputBytes: number,
+  snapshot = false,
+): number =>
   // The assembler estimate reserves up to 128 bytes per two-byte container.
   // Allow that 64x expansion plus byte/text copies before native JSON.parse,
   // whose individual container allocations cannot be intercepted.
-  inputBytes * 72 + READ_CHUNK_BYTES <=
+  (inputBytes * 72 + READ_CHUNK_BYTES) * (snapshot ? 2 : 1);
+
+/** Snapshot mode also reserves one projection for cooperative sealing bookkeeping. */
+const nativeParseFits = (inputBytes: number, snapshot = false): boolean =>
+  inputBytes <= NATIVE_PARSE_READ_BUDGET &&
+  nativeJsonParseRequiredBytes(inputBytes, snapshot) <=
     getHeapStatistics().total_available_size;
 
 /** One selected root member; repeated keys begin again with last-value semantics. */
@@ -55,6 +64,7 @@ export const readJsonObjectFile = (
   operation: string,
   scans: readonly ReadonlyMap<string, JsonObjectMemberReader>[],
   signal?: AbortSignal,
+  resources?: ArtifactResourceScope,
 ): Promise<Result<void, JsonInputFileFailure>> =>
   withRegularFile(
     path,
@@ -76,7 +86,9 @@ export const readJsonObjectFile = (
             value === null ||
             Array.isArray(value)
           )
-            throw new TypeError("JSON document root must be an object");
+            return err(
+              invalidJson(operation, "JSON document root must be an object"),
+            );
           for (const members of scans)
             for (const [key, member] of members) {
               if (!Object.hasOwn(value, key)) continue;
@@ -175,7 +187,9 @@ export const readJsonObjectFile = (
             signal === undefined ? {} : { signal },
           );
           if (!rootObject)
-            throw new TypeError("JSON document root must be an object");
+            return err(
+              invalidJson(operation, "JSON document root must be an object"),
+            );
           const digest = hash.digest("hex");
           if (previousDigest !== undefined && digest !== previousDigest)
             throw new RegularFileChangedError(path);
@@ -188,7 +202,10 @@ export const readJsonObjectFile = (
         throw cause;
       }
     },
-    { signal },
+    {
+      signal,
+      ...(resources === undefined ? {} : { resources }),
+    },
   );
 
 const memberConsumer = (
@@ -236,6 +253,8 @@ export const readJsonInputFile = (
   path: string,
   operation: string,
   signal?: AbortSignal,
+  resources?: ArtifactResourceScope,
+  snapshot = false,
 ): Promise<Result<unknown, JsonInputFileFailure>> =>
   withRegularFile(
     path,
@@ -249,8 +268,12 @@ export const readJsonInputFile = (
           path,
           operation,
           signal,
+          snapshot,
         );
-        if (native !== undefined) return native;
+        if (native !== undefined)
+          return native.ok && snapshot
+            ? await sealOwnedJsonInput(native.value, operation, signal)
+            : native;
         await pipeline(
           decodedChunks(handle, stats.size, path, signal),
           // Fuse synchronous token stages so only file chunks cross the async
@@ -265,7 +288,7 @@ export const readJsonInputFile = (
                 packNumbers: false,
               }),
               packJsonScalars(operation, stats.size, path),
-              admitJsonAssembly(operation, stats.size, path),
+              admitJsonAssembly(operation, stats.size, path, snapshot ? 2 : 1),
               streamValues(),
               (row: unknown): typeof none => {
                 if (
@@ -286,7 +309,9 @@ export const readJsonInputFile = (
           signal === undefined ? {} : { signal },
         );
         return found
-          ? ok(value)
+          ? snapshot
+            ? await sealOwnedJsonInput(value, operation, signal)
+            : ok(value)
           : err(invalidJson(operation, "JSON document is empty"));
       } catch (cause: unknown) {
         const failure = jsonReadFailure(cause, operation, stats.size, path);
@@ -294,7 +319,10 @@ export const readJsonInputFile = (
         throw cause;
       }
     },
-    { signal },
+    {
+      signal,
+      ...(resources === undefined ? {} : { resources }),
+    },
   );
 
 const jsonReadFailure = (
@@ -412,6 +440,7 @@ const admitJsonAssembly = (
   operation: string,
   inputFileBytes: number,
   path: string,
+  retainedMultiplier = 1,
 ) => {
   let projectedBytes = 0;
   let nextCheck = 0;
@@ -438,7 +467,8 @@ const admitJsonAssembly = (
       // values. Keep another whole projection available for container growth,
       // plus the next chunk of estimates between samples. This is admission
       // against live runtime headroom, not a fixed document-size policy.
-      const requiredBytes = projectedBytes + READ_CHUNK_BYTES;
+      const requiredBytes =
+        projectedBytes * retainedMultiplier + READ_CHUNK_BYTES;
       if (requiredBytes > heap.total_available_size)
         throw new AnalysisResourceConstraintError(
           operation,
@@ -560,8 +590,9 @@ const readNativeJson = async (
   path: string,
   operation: string,
   signal?: AbortSignal,
+  snapshot = false,
 ): Promise<Result<unknown, JsonInputFileFailure> | undefined> => {
-  if (!nativeParseFits(size)) return undefined;
+  if (!nativeParseFits(size, snapshot)) return undefined;
   const prefix = await readPrefix(handle, size + 1, signal);
   if (!prefix.complete || prefix.bytes.length !== size)
     throw new RegularFileChangedError(path);
